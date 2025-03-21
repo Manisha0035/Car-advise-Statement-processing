@@ -1,0 +1,113 @@
+import streamlit as st
+import pandas as pd
+import io
+import xlsxwriter
+
+# Title
+st.title("📊 Statement Processing - Step 2")
+
+# Upload files
+statement_file = st.file_uploader("📂 Upload Statement File (Excel)", type=["xls", "xlsx"])
+estimate_file = st.file_uploader("📂 Upload Estimate File (Excel)", type=["xls", "xlsx"])
+qr_file = st.file_uploader("📂 Upload Query Results File (Excel, Optional)", type=["xls", "xlsx"])
+
+if statement_file and estimate_file:
+    # Load files
+    statement_df = pd.read_excel(statement_file)
+    estimate_df = pd.read_excel(estimate_file)
+
+    # Determine the common key
+    common_key = None
+    if "PO" in statement_df.columns and "PO" in estimate_df.columns:
+        common_key = "PO"
+    elif "ROID" in statement_df.columns and "ROID" in estimate_df.columns:
+        common_key = "ROID"
+    else:
+        st.error("❌ No common columns (PO or ROID) found in both files.")
+
+    if common_key:
+        # Perform LEFT JOIN on Statement and Estimates
+        merged_df = pd.merge(statement_df, estimate_df, on=common_key, how="left", indicator=True)
+
+        # Add Match Status
+        merged_df["Match Status"] = merged_df["_merge"].map({
+            "both": "Matched with Estimates ✅",
+            "left_only": "Unmatched with Estimates (N/A)"
+        })
+
+        # Drop the merge indicator column
+        merged_df.drop(columns=["_merge"], inplace=True)
+
+        # Process Query Results file if uploaded
+        if qr_file:
+            qr_df = pd.read_excel(qr_file)
+
+            if common_key in qr_df.columns:
+                # Merge unmatched records with Query Results
+                merged_df = merged_df.merge(qr_df, on=common_key, how="left", suffixes=("", "_QR"))
+
+                # Detect dynamically named `_QR` column
+                qr_col_name = next((col for col in merged_df.columns if col.endswith("_QR")), None)
+
+                if qr_col_name:
+                    # Update Match Status for Query Results match
+                    merged_df["Match Status"] = merged_df.apply(
+                        lambda row: "Matched with Query Results ✅"
+                        if row["Match Status"] == "Unmatched with Estimates (N/A)" and not pd.isna(row[qr_col_name])
+                        else row["Match Status"], 
+                        axis=1
+                    )
+                else:
+                    st.warning(f"⚠ No '_QR' column found. Expected a match for '{common_key}_QR'.")
+
+            else:
+                st.error(f"❌ '{common_key}' column not found in Query Results file.")
+
+        # Move "Match Status" before "Case" column if it exists
+        if "Case" in merged_df.columns:
+            cols = merged_df.columns.tolist()
+            cols.insert(cols.index("Case"), cols.pop(cols.index("Match Status")))
+            merged_df = merged_df[cols]
+
+        # Display results
+        st.write("### 🔍 Matched & Unmatched Records")
+        st.dataframe(merged_df)
+
+        # Prepare file for download with formatting
+        output = io.BytesIO()
+        output_file_name = f"Step 2 {statement_file.name}"  # Dynamic name
+
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            merged_df.to_excel(writer, index=False, sheet_name="Step 2 Processed")
+            workbook = writer.book
+            worksheet = writer.sheets["Step 2 Processed"]
+
+            # Formatting
+            bold = workbook.add_format({"bold": True, "align": "center", "valign": "vcenter"})
+            center = workbook.add_format({"align": "center", "valign": "vcenter"})
+            red_format = workbook.add_format({"bg_color": "#FFCCCC"})  # Light Red for Unmatched Rows
+
+            # Auto-fit column width
+            for col_num, value in enumerate(merged_df.columns):
+                max_width = max(merged_df[value].astype(str).apply(len).max(), len(value)) + 2
+                worksheet.set_column(col_num, col_num, max_width, center)
+
+            # Apply formatting
+            worksheet.set_row(0, None, bold)  # Bold headers
+
+            # Highlight unmatched rows
+            for row_num in range(1, len(merged_df) + 1):
+                if merged_df.iloc[row_num - 1]["Match Status"] == "Unmatched with Estimates (N/A)":
+                    worksheet.set_row(row_num, None, red_format)
+
+        output.seek(0)
+
+        # Provide Download Option
+        st.download_button(
+            label="📥 Download Step 2 Output",
+            data=output,
+            file_name=output_file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.warning("⚠ No matching records found.")
